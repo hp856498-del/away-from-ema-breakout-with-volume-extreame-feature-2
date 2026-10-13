@@ -84,9 +84,13 @@ def check_away_and_breakout(df_scan, df_1h, df_4h, ema_period, breakout_type, vo
         return []
 
     df_scan['ema'] = df_scan['close'].ewm(span=ema_period, adjust=False).mean()
+    bb_middle = df_scan['close'].rolling(window=20).mean()
+    bb_std = df_scan['close'].rolling(window=20).std(ddof=0)
+    df_scan['bb_upper'] = bb_middle + (2 * bb_std)
+    df_scan['bb_lower'] = bb_middle - (2 * bb_std)
     matches = []
 
-    start_index = max(ema_period, vol_lookback if vol_mode == "Away Candle Vol vs Previous Candles" else 0)
+    start_index = max(ema_period, vol_lookback if "Previous Candles" in vol_mode else 0)
 
     for i in range(start_index, len(df_scan) - 1):
         row = df_scan.iloc[i]
@@ -98,6 +102,14 @@ def check_away_and_breakout(df_scan, df_1h, df_4h, ema_period, breakout_type, vo
 
         high, low, open_p, close_p, vol = row['high'], row['low'], row['open'], row['close'], row['volume']
         ema = row['ema']
+        bb_upper = row['bb_upper']
+        bb_lower = row['bb_lower']
+        bollinger_tags = []
+        if pd.notna(bb_upper) and high >= bb_upper:
+            bollinger_tags.append("(BU)")
+        if pd.notna(bb_lower) and low <= bb_lower:
+            bollinger_tags.append("(BD)")
+        bollinger_tag = " ".join(bollinger_tags)
 
         # 1. Check Away condition (Touch Nothing)
         is_away_above = (low > ema) and (high > ema) and (open_p > ema) and (close_p > ema)
@@ -106,10 +118,14 @@ def check_away_and_breakout(df_scan, df_1h, df_4h, ema_period, breakout_type, vo
         if not (is_away_above or is_away_below):
             continue
 
-        # 2. Away Candle Volume Lookback Filter Check
-        if vol_mode == "Away Candle Vol vs Previous Candles":
-            prev_volumes = df_scan.iloc[i - vol_lookback : i]['volume']
+        # 2. Volume Filter Checks
+        prev_volumes = df_scan.iloc[i - vol_lookback : i]['volume'] if vol_lookback > 0 else pd.Series([])
+
+        if vol_mode == "Away Candle Vol vs Previous Candles (Higher)":
             if not (vol > prev_volumes).all():
+                continue
+        elif vol_mode == "Away Candle Vol vs Previous Candles (Lower)":
+            if not (vol < prev_volumes).all():
                 continue
 
         # 3. Check next 1 to 3 candles for breakout
@@ -172,6 +188,9 @@ def check_away_and_breakout(df_scan, df_1h, df_4h, ema_period, breakout_type, vo
                 matches.append({
                     'trend_symbol': trend_symbol,
                     'position_tag': position_tag,
+                    'bollinger_tag': bollinger_tag,
+                    'is_away_below': is_away_below,
+                    'is_away_above': is_away_above,
                     'Away Candle Time (IST)': c_time.strftime('%Y-%m-%d %H:%M'),
                     'Away Price (High/Low)': f"{high} / {low}",
                     'Away Vol': f"{vol:,.2f}",
@@ -203,7 +222,22 @@ def process_single_symbol(symbol, tf_option, ema_option, breakout_option, vol_mo
 
     symbol_results = []
     for match in matches:
-        match['Symbol'] = f"{match['trend_symbol']} {symbol} {match['position_tag']}"
+        label_parts = [symbol]
+        if match['bollinger_tag']:
+            label_parts.append(match['bollinger_tag'])
+        label_parts.append(match['position_tag'])
+        coin_label = " ".join(label_parts)
+        base_symbol_text = f"{match['trend_symbol']} {coin_label}"
+        is_bullish = "Bullish" in match['Type']
+        is_bearish = "Bearish" in match['Type']
+
+        if match['is_away_below'] and is_bullish:
+            match['Symbol'] = f"🟢 {coin_label}"
+        elif match['is_away_above'] and is_bearish:
+            match['Symbol'] = f"🔴 {coin_label}"
+        else:
+            match['Symbol'] = base_symbol_text
+
         symbol_results.append(match)
 
     return symbol_results
@@ -233,7 +267,8 @@ vol_mode = st.sidebar.radio(
     "Select Volume Filter Type:",
     [
         "Breakout Vol vs Away Vol", 
-        "Away Candle Vol vs Previous Candles",
+        "Away Candle Vol vs Previous Candles (Higher)",
+        "Away Candle Vol vs Previous Candles (Lower)",
         "Breakout Candle Vol vs Previous Candles"
     ]
 )
@@ -249,19 +284,19 @@ if vol_mode == "Breakout Vol vs Away Vol":
             "Lower Volume (Breakout Vol < Away Vol)"
         ]
     )
-elif vol_mode == "Away Candle Vol vs Previous Candles":
+elif "Away Candle Vol vs Previous Candles" in vol_mode:
     vol_lookback = st.sidebar.selectbox(
-        "Away Vol Higher Than Prev N Candles:",
+        "Away Candles Lookback Count (N):",
         [2, 3, 4, 5, 7],
-        index=1,
-        help="Away candle ka volume picchli N candles ke volume se zyada hona chahiye."
+        index=3, # Default 5
+        help="Away candle ka volume pichhli N candles ke mukable comparison ke liye."
     )
 elif vol_mode == "Breakout Candle Vol vs Previous Candles":
     vol_lookback = st.sidebar.selectbox(
         "Breakout Vol Higher Than Prev N Candles:",
         [2, 3, 4, 5, 7],
         index=2,
-        help="Breakout candle ka volume apni picchli N candles ke volume se zyada hona chahiye."
+        help="Breakout candle ka volume apni pichhli N candles ke volume se zyada hona chahiye."
     )
 
 # 6. Date & Time Filter (IST)
@@ -282,6 +317,21 @@ if enable_date:
     else:
         start_datetime = IST.localize(datetime.combine(selected_date, time(0, 0)))
         end_datetime = IST.localize(datetime.combine(selected_date, time(23, 59)))
+
+def style_breakout_symbol(row):
+    """Color and bold only the requested Symbol cells in the results table."""
+    styles = [""] * len(row)
+    symbol_column = row.index.get_loc("Symbol")
+    symbol = str(row.get("Symbol", ""))
+    breakout_type = str(row.get("Type", ""))
+
+    if "(D)" in symbol and "Bullish" in breakout_type:
+        styles[symbol_column] = "color: #16803c; font-weight: bold;"
+    elif "(U)" in symbol and "Bearish" in breakout_type:
+        styles[symbol_column] = "color: #dc2626; font-weight: bold;"
+
+    return styles
+
 
 # Run Screener Button
 if st.button("🚀 Start Scanning"):
@@ -320,25 +370,22 @@ if st.button("🚀 Start Scanning"):
 
     if results:
         res_df = pd.DataFrame(results)
+
         cols = [
             'Symbol', 'Type', 'Away Candle Time (IST)', 'Away Price (High/Low)', 'Away Vol', 
             '1h 51 EMA Dist', '4h 51 EMA Dist', '4h 101 EMA Dist',
             'Breakout Candle Time (IST)', 'Breakout Offset', 'Breakout Close', 'Breakout Vol'
         ]
-        res_df = res_df[cols]
 
-        def style_symbol(row):
-            symbol = row['Symbol']
-            breakout_type = row['Type']
-            if '(D)' in symbol and breakout_type.startswith('Bullish'):
-                style = 'color: green; font-weight: bold;'
-            elif '(U)' in symbol and breakout_type.startswith('Bearish'):
-                style = 'color: red; font-weight: bold;'
-            else:
-                style = ''
-            return [style if column == 'Symbol' else '' for column in row.index]
+        final_df = res_df[cols]
 
-        st.success(f"Found {len(res_df)} matching setup(s)!")
-        st.dataframe(res_df.style.apply(style_symbol, axis=1), use_container_width=True)
+        st.success(f"Found {len(final_df)} matching setup(s)!")
+
+        # Keep the table interactive and style only the requested Symbol cells.
+        styled_results = final_df.style.apply(
+            style_breakout_symbol,
+            axis=1
+        )
+        st.dataframe(styled_results, use_container_width=True)
     else:
         st.warning("Selected criteria par koi coin scan me nahi mila.")
