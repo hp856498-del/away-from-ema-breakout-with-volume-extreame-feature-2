@@ -77,6 +77,49 @@ def calculate_closest_ema_distance(high, low, ema_val):
         sign = "+" if pct >= 0 else ""
         return f"Low({sign}{pct:.2f}%)"
 
+def is_large_breakout_candle(away_high, away_low, breakout_high, breakout_low, multiplier=1.70):
+    """Whether breakout candle's full range is at least the requested multiple."""
+    away_range = float(away_high) - float(away_low)
+    breakout_range = float(breakout_high) - float(breakout_low)
+    return away_range > 0 and breakout_range >= away_range * multiplier
+
+def get_breakout_size_markers(
+    away_high,
+    away_low,
+    previous_high,
+    previous_low,
+    breakout_high,
+    breakout_low
+):
+    """Return star flags; prior-candle comparison applies only to 1.70x+ setups."""
+    away_range = float(away_high) - float(away_low)
+    previous_range = float(previous_high) - float(previous_low)
+    breakout_range = float(breakout_high) - float(breakout_low)
+
+    star = is_large_breakout_candle(
+        away_high,
+        away_low,
+        breakout_high,
+        breakout_low,
+        multiplier=1.70
+    )
+    if not star:
+        return False, False, False
+
+    two_x_away = is_large_breakout_candle(
+        away_high,
+        away_low,
+        breakout_high,
+        breakout_low,
+        multiplier=2.30
+    )
+    two_stars = two_x_away or (
+        previous_range > 0
+        and breakout_range >= previous_range * 1.60
+    )
+
+    return star, two_stars, two_x_away
+
 def check_away_and_breakout(df_scan, df_1h, df_4h, ema_period, breakout_type, vol_mode, vol_condition, vol_lookback, date_filter_enabled, start_datetime, end_datetime):
     """Scan dataframe for EMA away + chosen Volume filter + Breakout."""
     min_required = ema_period + vol_lookback + 5
@@ -174,6 +217,15 @@ def check_away_and_breakout(df_scan, df_1h, df_4h, ema_period, breakout_type, vo
 
             if breakout_detected:
                 position_tag = "(U)" if is_away_above else "(D)"
+                previous_row = df_scan.iloc[i - 1]
+                large_breakout_candle, double_large_breakout_candle, very_large_breakout_candle = get_breakout_size_markers(
+                    high,
+                    low,
+                    previous_row["high"],
+                    previous_row["low"],
+                    b_high,
+                    b_low
+                )
 
                 ema_1h_51 = get_ema_at_timestamp(df_1h, 51, c_time)
                 ema_4h_51 = get_ema_at_timestamp(df_4h, 51, c_time)
@@ -189,6 +241,9 @@ def check_away_and_breakout(df_scan, df_1h, df_4h, ema_period, breakout_type, vo
                     'trend_symbol': trend_symbol,
                     'position_tag': position_tag,
                     'bollinger_tag': bollinger_tag,
+                    'large_breakout_candle': large_breakout_candle,
+                    'double_large_breakout_candle': double_large_breakout_candle,
+                    'very_large_breakout_candle': very_large_breakout_candle,
                     'is_away_below': is_away_below,
                     'is_away_above': is_away_above,
                     'Away Candle Time (IST)': c_time.strftime('%Y-%m-%d %H:%M'),
@@ -222,7 +277,14 @@ def process_single_symbol(symbol, tf_option, ema_option, breakout_option, vol_mo
 
     symbol_results = []
     for match in matches:
+        match['coin_name'] = symbol
         label_parts = [symbol]
+        if match.get("very_large_breakout_candle"):
+            label_parts.insert(0, "(2)⭐⭐")
+        elif match.get("double_large_breakout_candle"):
+            label_parts.insert(0, "⭐⭐")
+        elif match.get("large_breakout_candle"):
+            label_parts.insert(0, "⭐")
         if match['bollinger_tag']:
             label_parts.append(match['bollinger_tag'])
         label_parts.append(match['position_tag'])
@@ -380,6 +442,46 @@ if st.button("🚀 Start Scanning"):
         final_df = res_df[cols]
 
         st.success(f"Found {len(final_df)} matching setup(s)!")
+        red_mask = (
+            res_df['is_away_above'].fillna(False)
+            & res_df['Type'].str.contains("Bearish", na=False)
+        )
+        green_mask = (
+            res_df['is_away_below'].fillna(False)
+            & res_df['Type'].str.contains("Bullish", na=False)
+        )
+
+        def get_result_counts(group):
+            coins = group.groupby('coin_name')[
+                [
+                    'large_breakout_candle',
+                    'double_large_breakout_candle',
+                    'very_large_breakout_candle'
+                ]
+            ].any()
+            is_double_star = coins['double_large_breakout_candle']
+            is_very_large = coins['very_large_breakout_candle']
+            is_star = coins['large_breakout_candle']
+            return (
+                len(coins),
+                int((is_star & ~is_double_star).sum()),
+                int((is_double_star & ~is_very_large).sum()),
+                int(is_very_large.sum())
+            )
+
+        red_total, red_star, red_double_star, red_very_large = get_result_counts(res_df.loc[red_mask])
+        green_total, green_star, green_double_star, green_very_large = get_result_counts(res_df.loc[green_mask])
+        st.markdown(
+            f'<div style="color:#dc2626;font-weight:700">Red text: total {red_total} | '
+            f'⭐ {red_star} | ⭐⭐ {red_double_star} | (2)⭐⭐ {red_very_large}</div>'
+            f'<div style="color:#16803c;font-weight:700">Green text: total {green_total} | '
+            f'⭐ {green_star} | ⭐⭐ {green_double_star} | (2)⭐⭐ {green_very_large}</div>',
+            unsafe_allow_html=True
+        )
+        st.caption(
+            "⭐ = away candle se 1.70x+. ⭐⭐ = away candle se 1.70x+ aur usse pehle wali candle se 1.60x+. "
+            "(2)⭐⭐ = away candle se 2.30x+."
+        )
 
         # Keep the table interactive and style only the requested Symbol cells.
         styled_results = final_df.style.apply(
