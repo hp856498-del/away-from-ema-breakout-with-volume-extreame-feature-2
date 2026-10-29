@@ -91,7 +91,7 @@ def get_breakout_size_markers(
     breakout_high,
     breakout_low
 ):
-    """Return star flags; prior-candle comparison applies only to 1.70x+ setups."""
+    """Return star flags, including 2.30x setups that also exceed prior-candle range."""
     away_range = float(away_high) - float(away_low)
     previous_range = float(previous_high) - float(previous_low)
     breakout_range = float(breakout_high) - float(breakout_low)
@@ -104,7 +104,7 @@ def get_breakout_size_markers(
         multiplier=1.70
     )
     if not star:
-        return False, False, False
+        return False, False, False, False
 
     two_x_away = is_large_breakout_candle(
         away_high,
@@ -117,8 +117,13 @@ def get_breakout_size_markers(
         previous_range > 0
         and breakout_range >= previous_range * 1.60
     )
+    two_x_away_two_stars = (
+        two_x_away
+        and previous_range > 0
+        and breakout_range >= previous_range * 1.60
+    )
 
-    return star, two_stars, two_x_away
+    return star, two_stars, two_x_away, two_x_away_two_stars
 
 def check_away_and_breakout(df_scan, df_1h, df_4h, ema_period, breakout_type, vol_mode, vol_condition, vol_lookback, date_filter_enabled, start_datetime, end_datetime):
     """Scan dataframe for EMA away + chosen Volume filter + Breakout."""
@@ -218,7 +223,12 @@ def check_away_and_breakout(df_scan, df_1h, df_4h, ema_period, breakout_type, vo
             if breakout_detected:
                 position_tag = "(U)" if is_away_above else "(D)"
                 previous_row = df_scan.iloc[i - 1]
-                large_breakout_candle, double_large_breakout_candle, very_large_breakout_candle = get_breakout_size_markers(
+                (
+                    large_breakout_candle,
+                    double_large_breakout_candle,
+                    very_large_breakout_candle,
+                    very_large_double_star_breakout_candle
+                ) = get_breakout_size_markers(
                     high,
                     low,
                     previous_row["high"],
@@ -244,6 +254,7 @@ def check_away_and_breakout(df_scan, df_1h, df_4h, ema_period, breakout_type, vo
                     'large_breakout_candle': large_breakout_candle,
                     'double_large_breakout_candle': double_large_breakout_candle,
                     'very_large_breakout_candle': very_large_breakout_candle,
+                    'very_large_double_star_breakout_candle': very_large_double_star_breakout_candle,
                     'is_away_below': is_away_below,
                     'is_away_above': is_away_above,
                     'Away Candle Time (IST)': c_time.strftime('%Y-%m-%d %H:%M'),
@@ -279,8 +290,10 @@ def process_single_symbol(symbol, tf_option, ema_option, breakout_option, vol_mo
     for match in matches:
         match['coin_name'] = symbol
         label_parts = [symbol]
-        if match.get("very_large_breakout_candle"):
-            label_parts.insert(0, "(2)⭐⭐")
+        if match.get("very_large_double_star_breakout_candle"):
+            label_parts.insert(0, "(2) ⭐⭐")
+        elif match.get("very_large_breakout_candle"):
+            label_parts.insert(0, "(2) ⭐")
         elif match.get("double_large_breakout_candle"):
             label_parts.insert(0, "⭐⭐")
         elif match.get("large_breakout_candle"):
@@ -456,31 +469,34 @@ if st.button("🚀 Start Scanning"):
                 [
                     'large_breakout_candle',
                     'double_large_breakout_candle',
-                    'very_large_breakout_candle'
+                    'very_large_breakout_candle',
+                    'very_large_double_star_breakout_candle'
                 ]
             ].any()
             is_double_star = coins['double_large_breakout_candle']
             is_very_large = coins['very_large_breakout_candle']
+            is_very_large_double_star = coins['very_large_double_star_breakout_candle']
             is_star = coins['large_breakout_candle']
             return (
                 len(coins),
                 int((is_star & ~is_double_star).sum()),
                 int((is_double_star & ~is_very_large).sum()),
-                int(is_very_large.sum())
+                int((is_very_large & ~is_very_large_double_star).sum()),
+                int(is_very_large_double_star.sum())
             )
 
-        red_total, red_star, red_double_star, red_very_large = get_result_counts(res_df.loc[red_mask])
-        green_total, green_star, green_double_star, green_very_large = get_result_counts(res_df.loc[green_mask])
+        red_total, red_star, red_double_star, red_very_large, red_very_large_double = get_result_counts(res_df.loc[red_mask])
+        green_total, green_star, green_double_star, green_very_large, green_very_large_double = get_result_counts(res_df.loc[green_mask])
         st.markdown(
             f'<div style="color:#dc2626;font-weight:700">Red text: total {red_total} | '
-            f'⭐ {red_star} | ⭐⭐ {red_double_star} | (2)⭐⭐ {red_very_large}</div>'
+            f'⭐ {red_star} | ⭐⭐ {red_double_star} | (2) ⭐ {red_very_large} | (2) ⭐⭐ {red_very_large_double}</div>'
             f'<div style="color:#16803c;font-weight:700">Green text: total {green_total} | '
-            f'⭐ {green_star} | ⭐⭐ {green_double_star} | (2)⭐⭐ {green_very_large}</div>',
+            f'⭐ {green_star} | ⭐⭐ {green_double_star} | (2) ⭐ {green_very_large} | (2) ⭐⭐ {green_very_large_double}</div>',
             unsafe_allow_html=True
         )
         st.caption(
             "⭐ = away candle se 1.70x+. ⭐⭐ = away candle se 1.70x+ aur usse pehle wali candle se 1.60x+. "
-            "(2)⭐⭐ = away candle se 2.30x+."
+            "(2) ⭐ = away candle se 2.30x+. (2) ⭐⭐ = away candle se 2.30x+ aur usse pehle wali candle se 1.60x+."
         )
 
         # Keep the table interactive and style only the requested Symbol cells.
