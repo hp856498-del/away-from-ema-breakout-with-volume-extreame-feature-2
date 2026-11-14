@@ -362,14 +362,14 @@ if vol_mode == "Breakout Vol vs Away Vol":
 elif "Away Candle Vol vs Previous Candles" in vol_mode:
     vol_lookback = st.sidebar.selectbox(
         "Away Candles Lookback Count (N):",
-        [2, 3, 4, 5, 7],
+        [2, 3, 4, 5, 7, 10, 15, 20, 30],
         index=3, # Default 5
         help="Away candle ka volume pichhli N candles ke mukable comparison ke liye."
     )
 elif vol_mode == "Breakout Candle Vol vs Previous Candles":
     vol_lookback = st.sidebar.selectbox(
         "Breakout Vol Higher Than Prev N Candles:",
-        [2, 3, 4, 5, 7],
+        [2, 3, 4, 5, 7, 10, 15, 20, 30],
         index=2,
         help="Breakout candle ka volume apni pichhli N candles ke volume se zyada hona chahiye."
     )
