@@ -1,7 +1,8 @@
 import streamlit as st
 import ccxt
 import pandas as pd
-from datetime import datetime, time
+import numpy as np
+from datetime import datetime, time, timedelta
 import pytz
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -9,55 +10,119 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 st.set_page_config(page_title="EMA Breakout Crypto Screener", layout="wide")
 st.title("📈 Crypto EMA Away & Breakout Screener")
 
-# Initialize Binance exchange via CCXT
-exchange = ccxt.binance({
-    'enableRateLimit': True,
-    'options': {'defaultType': 'spot'}
-})
-
 IST = pytz.timezone('Asia/Kolkata')
 
-@st.cache_data(ttl=300)
-def get_top_binance_symbols(limit):
-    """Fetch top active USDT spot trading pairs sorted by 24h volume."""
+EXCHANGE_OPTIONS = {
+    "Binance": "binance",
+    "Bybit": "bybit",
+    "OKX": "okx"
+}
+
+LOOKBACK_OPTIONS_AWAY = [2, 3, 4, 5, 7, 10, 15, 20, 30, 40, 50, 60, 70, 90, 100]
+LOOKBACK_OPTIONS_BREAKOUT = [2, 3, 4, 5, 7, 10, 15, 20, 30, 40, 50, 60, 70, 90, 100]
+
+@st.cache_resource(show_spinner=False)
+def get_cached_exchange(exchange_id: str):
+    """Create and cache a single CCXT spot exchange instance with loaded markets."""
+    exchange_cls = getattr(ccxt, exchange_id)
+    opts = {'defaultType': 'spot'}
+    if exchange_id == 'binance':
+        opts['fetchMarkets'] = ['spot']
+    ex = exchange_cls({
+        'enableRateLimit': True,
+        'timeout': 20000,
+        'options': opts
+    })
     try:
-        tickers = exchange.fetch_tickers()
+        ex.load_markets()
+    except Exception:
+        if exchange_id == 'binance':
+            try:
+                ex.options['fetchMarkets'] = ['spot']
+                ex.load_markets(True)
+            except Exception:
+                pass
+    return ex
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_top_exchange_symbols(exchange_id: str, limit: int):
+    """Fetch top active USDT spot trading pairs sorted by 24h volume for selected exchange."""
+    try:
+        ex = get_cached_exchange(exchange_id)
+        try:
+            tickers = ex.fetch_tickers()
+        except Exception:
+            if exchange_id == 'binance':
+                markets = ex.markets if getattr(ex, 'markets', None) else ex.load_markets()
+                spot_symbols = [
+                    s for s, m in markets.items()
+                    if m.get('spot') and s.endswith('/USDT') and m.get('active', True)
+                    and not any(x in s for x in ['UP/', 'DOWN/', 'BEAR/', 'BULL/'])
+                ]
+                return spot_symbols[:limit]
+            raise
+
         usdt_pairs = []
         for symbol, ticker in tickers.items():
-            if symbol.endswith('/USDT') and ticker.get('quoteVolume') is not None:
-                if not any(x in symbol for x in ['UP/', 'DOWN/', 'BEAR/', 'BULL/']):
-                    usdt_pairs.append({
-                        'symbol': symbol,
-                        'volume': ticker['quoteVolume']
-                    })
+            if not symbol.endswith('/USDT'):
+                continue
+            if any(x in symbol for x in ['UP/', 'DOWN/', 'BEAR/', 'BULL/']):
+                continue
+
+            quote_vol = ticker.get('quoteVolume')
+            if quote_vol is None:
+                info = ticker.get('info') or {}
+                for k in ('turnover24h', 'volCcy24h', 'quoteVolume'):
+                    if info.get(k) is not None:
+                        try:
+                            quote_vol = float(info[k])
+                            break
+                        except (ValueError, TypeError):
+                            pass
+
+            if quote_vol is not None and float(quote_vol) > 0:
+                usdt_pairs.append({
+                    'symbol': symbol,
+                    'volume': float(quote_vol)
+                })
+
         usdt_pairs = sorted(usdt_pairs, key=lambda x: x['volume'], reverse=True)
         return [p['symbol'] for p in usdt_pairs[:limit]]
     except Exception as e:
-        st.error(f"Error fetching symbols from Binance: {e}")
+        st.error(f"Error fetching symbols from {exchange_id.upper()}: {e}")
         return []
 
-def fetch_ohlcv_data(symbol, timeframe, limit=300):
-    """Fetch OHLCV data from Binance and prepare dataframe."""
+@st.cache_data(ttl=180, show_spinner=False)
+def fetch_ohlcv_cached(exchange_id: str, symbol: str, timeframe: str, limit: int):
+    """Fetch and cache OHLCV data for faster repeated scans."""
+    ex = get_cached_exchange(exchange_id)
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        req_limit = min(limit, 1000) if ex.id == 'bybit' else limit
+        ohlcv = ex.fetch_ohlcv(symbol, timeframe, limit=req_limit)
+        if not ohlcv:
+            return None, None
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['datetime_ist'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(IST)
-        # Drop current unclosed live candle
         df = df.iloc[:-1].reset_index(drop=True)
-        return df
-    except Exception:
-        return None
+        return df, None
+    except Exception as e:
+        return None, f"{symbol} ({timeframe}): {str(e)[:120]}"
 
-def get_ema_at_timestamp(df, ema_period, target_time):
-    """Find the EMA value of the candle corresponding to or just before target_time."""
+def prepare_ema_series(df, ema_period):
+    """Precompute EMA series once per dataframe for fast timestamp lookup."""
     if df is None or len(df) < ema_period:
         return None
-    df = df.copy()
-    df['ema'] = df['close'].ewm(span=ema_period, adjust=False).mean()
+    out = df[['datetime_ist', 'close']].copy()
+    out['ema'] = out['close'].ewm(span=ema_period, adjust=False).mean()
+    return out
 
-    valid_rows = df[df['datetime_ist'] <= target_time]
-    if not valid_rows.empty:
-        return valid_rows.iloc[-1]['ema']
+def get_ema_at_timestamp_fast(ema_df, target_time):
+    """Fast lookup of EMA value at or just before target_time."""
+    if ema_df is None or ema_df.empty:
+        return None
+    idx = ema_df['datetime_ist'].searchsorted(target_time, side='right') - 1
+    if idx >= 0:
+        return float(ema_df.iloc[idx]['ema'])
     return None
 
 def calculate_closest_ema_distance(high, low, ema_val):
@@ -125,39 +190,43 @@ def get_breakout_size_markers(
 
     return star, two_stars, two_x_away, two_x_away_two_stars
 
-def check_away_and_breakout(df_scan, df_1h, df_4h, ema_period, breakout_type, vol_mode, vol_condition, vol_lookback, date_filter_enabled, start_datetime, end_datetime):
-    """Scan dataframe for EMA away + chosen Volume filter + Breakout."""
+def check_away_and_breakout(df_scan, ema_1h_51_df, ema_4h_51_df, ema_4h_101_df, ema_period, breakout_type, vol_mode, vol_condition, vol_lookback, date_filter_enabled, start_datetime, end_datetime, skip_htf_dist=False):
+    """Scan dataframe for EMA away + chosen Volume filter + Breakout using fast array indexing."""
     min_required = ema_period + vol_lookback + 5
-    if df_scan is None or len(df_scan) < min_required:
+    n_rows = len(df_scan) if df_scan is not None else 0
+    if df_scan is None or n_rows < min_required:
         return []
 
-    df_scan['ema'] = df_scan['close'].ewm(span=ema_period, adjust=False).mean()
+    ema_series = df_scan['close'].ewm(span=ema_period, adjust=False).mean()
     bb_middle = df_scan['close'].rolling(window=20).mean()
     bb_std = df_scan['close'].rolling(window=20).std(ddof=0)
-    df_scan['bb_upper'] = bb_middle + (2 * bb_std)
-    df_scan['bb_lower'] = bb_middle - (2 * bb_std)
-    matches = []
+    bb_upper_arr = (bb_middle + (2 * bb_std)).to_numpy()
+    bb_lower_arr = (bb_middle - (2 * bb_std)).to_numpy()
 
+    high_arr = df_scan['high'].to_numpy(dtype=float)
+    low_arr = df_scan['low'].to_numpy(dtype=float)
+    open_arr = df_scan['open'].to_numpy(dtype=float)
+    close_arr = df_scan['close'].to_numpy(dtype=float)
+    vol_arr = df_scan['volume'].to_numpy(dtype=float)
+    ema_arr = ema_series.to_numpy(dtype=float)
+    times_list = df_scan['datetime_ist'].tolist()
+
+    matches = []
     start_index = max(ema_period, vol_lookback if "Previous Candles" in vol_mode else 0)
 
-    for i in range(start_index, len(df_scan) - 1):
-        row = df_scan.iloc[i]
-        c_time = row['datetime_ist']
+    for i in range(start_index, n_rows - 1):
+        c_time = times_list[i]
 
         if date_filter_enabled:
             if not (start_datetime <= c_time <= end_datetime):
                 continue
 
-        high, low, open_p, close_p, vol = row['high'], row['low'], row['open'], row['close'], row['volume']
-        ema = row['ema']
-        bb_upper = row['bb_upper']
-        bb_lower = row['bb_lower']
-        bollinger_tags = []
-        if pd.notna(bb_upper) and high >= bb_upper:
-            bollinger_tags.append("(BU)")
-        if pd.notna(bb_lower) and low <= bb_lower:
-            bollinger_tags.append("(BD)")
-        bollinger_tag = " ".join(bollinger_tags)
+        high = high_arr[i]
+        low = low_arr[i]
+        open_p = open_arr[i]
+        close_p = close_arr[i]
+        vol = vol_arr[i]
+        ema = ema_arr[i]
 
         # 1. Check Away condition (Touch Nothing)
         is_away_above = (low > ema) and (high > ema) and (open_p > ema) and (close_p > ema)
@@ -167,23 +236,34 @@ def check_away_and_breakout(df_scan, df_1h, df_4h, ema_period, breakout_type, vo
             continue
 
         # 2. Volume Filter Checks
-        prev_volumes = df_scan.iloc[i - vol_lookback : i]['volume'] if vol_lookback > 0 else pd.Series([])
+        if vol_lookback > 0:
+            prev_vols = vol_arr[i - vol_lookback : i]
+            if vol_mode == "Away Candle Vol vs Previous Candles (Higher)":
+                if not np.all(vol > prev_vols):
+                    continue
+            elif vol_mode == "Away Candle Vol vs Previous Candles (Lower)":
+                if not np.all(vol < prev_vols):
+                    continue
 
-        if vol_mode == "Away Candle Vol vs Previous Candles (Higher)":
-            if not (vol > prev_volumes).all():
-                continue
-        elif vol_mode == "Away Candle Vol vs Previous Candles (Lower)":
-            if not (vol < prev_volumes).all():
-                continue
+        bb_upper = bb_upper_arr[i]
+        bb_lower = bb_lower_arr[i]
+        bollinger_tags = []
+        if not np.isnan(bb_upper) and high >= bb_upper:
+            bollinger_tags.append("(BU)")
+        if not np.isnan(bb_lower) and low <= bb_lower:
+            bollinger_tags.append("(BD)")
+        bollinger_tag = " ".join(bollinger_tags)
 
         # 3. Check next 1 to 3 candles for breakout
         for offset in range(1, 4):
             breakout_idx = i + offset
-            if breakout_idx >= len(df_scan):
+            if breakout_idx >= n_rows:
                 break
 
-            b_row = df_scan.iloc[breakout_idx]
-            b_high, b_low, b_close, b_vol = b_row['high'], b_row['low'], b_row['close'], b_row['volume']
+            b_high = high_arr[breakout_idx]
+            b_low = low_arr[breakout_idx]
+            b_close = close_arr[breakout_idx]
+            b_vol = vol_arr[breakout_idx]
 
             # Breakout Vol vs Away Vol Filter Check
             if vol_mode == "Breakout Vol vs Away Vol":
@@ -196,8 +276,8 @@ def check_away_and_breakout(df_scan, df_1h, df_4h, ema_period, breakout_type, vo
             if vol_mode == "Breakout Candle Vol vs Previous Candles":
                 if breakout_idx - vol_lookback < 0:
                     continue
-                b_prev_volumes = df_scan.iloc[breakout_idx - vol_lookback : breakout_idx]['volume']
-                if not (b_vol > b_prev_volumes).all():
+                b_prev_vols = vol_arr[breakout_idx - vol_lookback : breakout_idx]
+                if not np.all(b_vol > b_prev_vols):
                     continue
 
             breakout_detected = False
@@ -222,7 +302,6 @@ def check_away_and_breakout(df_scan, df_1h, df_4h, ema_period, breakout_type, vo
 
             if breakout_detected:
                 position_tag = "(U)" if is_away_above else "(D)"
-                previous_row = df_scan.iloc[i - 1]
                 (
                     large_breakout_candle,
                     double_large_breakout_candle,
@@ -231,21 +310,30 @@ def check_away_and_breakout(df_scan, df_1h, df_4h, ema_period, breakout_type, vo
                 ) = get_breakout_size_markers(
                     high,
                     low,
-                    previous_row["high"],
-                    previous_row["low"],
+                    high_arr[i - 1],
+                    low_arr[i - 1],
                     b_high,
                     b_low
                 )
 
-                ema_1h_51 = get_ema_at_timestamp(df_1h, 51, c_time)
-                ema_4h_51 = get_ema_at_timestamp(df_4h, 51, c_time)
-                ema_4h_101 = get_ema_at_timestamp(df_4h, 101, c_time)
+                ema_4h_51 = get_ema_at_timestamp_fast(ema_4h_51_df, c_time)
+                ema_4h_101 = get_ema_at_timestamp_fast(ema_4h_101_df, c_time)
 
-                trend_symbol = "🟢" if (ema_4h_51 is not None and ema_4h_101 is not None and ema_4h_51 > ema_4h_101) else "🔴"
+                # Circle strictly reflects 4h 51 EMA vs 4h 101 EMA
+                if ema_4h_51 is not None and ema_4h_101 is not None:
+                    trend_symbol = "🟢" if ema_4h_51 > ema_4h_101 else "🔴"
+                else:
+                    trend_symbol = "⚪"
 
-                dist_1h_51 = calculate_closest_ema_distance(high, low, ema_1h_51)
-                dist_4h_51 = calculate_closest_ema_distance(high, low, ema_4h_51)
-                dist_4h_101 = calculate_closest_ema_distance(high, low, ema_4h_101)
+                if skip_htf_dist:
+                    dist_1h_51 = "N/A"
+                    dist_4h_51 = "N/A"
+                    dist_4h_101 = "N/A"
+                else:
+                    ema_1h_51 = get_ema_at_timestamp_fast(ema_1h_51_df, c_time)
+                    dist_1h_51 = calculate_closest_ema_distance(high, low, ema_1h_51)
+                    dist_4h_51 = calculate_closest_ema_distance(high, low, ema_4h_51)
+                    dist_4h_101 = calculate_closest_ema_distance(high, low, ema_4h_101)
 
                 matches.append({
                     'trend_symbol': trend_symbol,
@@ -263,7 +351,7 @@ def check_away_and_breakout(df_scan, df_1h, df_4h, ema_period, breakout_type, vo
                     '1h 51 EMA Dist': dist_1h_51,
                     '4h 51 EMA Dist': dist_4h_51,
                     '4h 101 EMA Dist': dist_4h_101,
-                    'Breakout Candle Time (IST)': b_row['datetime_ist'].strftime('%Y-%m-%d %H:%M'),
+                    'Breakout Candle Time (IST)': times_list[breakout_idx].strftime('%Y-%m-%d %H:%M'),
                     'Breakout Offset': f"{offset} candle(s) after",
                     'Breakout Close': b_close,
                     'Breakout Vol': f"{b_vol:,.2f}",
@@ -273,17 +361,25 @@ def check_away_and_breakout(df_scan, df_1h, df_4h, ema_period, breakout_type, vo
 
     return matches
 
-def process_single_symbol(symbol, tf_option, ema_option, breakout_option, vol_mode, vol_condition, vol_lookback, enable_date, start_datetime, end_datetime):
-    """Helper function to process a single symbol for multithreading."""
-    df_scan = fetch_ohlcv_data(symbol, tf_option)
+def process_single_symbol(exchange_id, symbol, tf_option, ema_option, breakout_option, vol_mode, vol_condition, vol_lookback, enable_date, start_datetime, end_datetime, candle_limit, skip_htf_dist=False):
+    """Helper function to process a single symbol using cached OHLCV fetches."""
+    df_scan, err_scan = fetch_ohlcv_cached(exchange_id, symbol, tf_option, candle_limit)
     if df_scan is None:
-        return []
+        return [], err_scan
 
-    df_1h = fetch_ohlcv_data(symbol, "1h") if tf_option != "1h" else df_scan
-    df_4h = fetch_ohlcv_data(symbol, "4h") if tf_option != "4h" else df_scan
+    if skip_htf_dist:
+        ema_1h_51_df = None
+        ema_4h_51_df = None
+        ema_4h_101_df = None
+    else:
+        df_1h, _ = fetch_ohlcv_cached(exchange_id, symbol, "1h", candle_limit) if tf_option != "1h" else (df_scan, None)
+        df_4h, _ = fetch_ohlcv_cached(exchange_id, symbol, "4h", candle_limit) if tf_option != "4h" else (df_scan, None)
+        ema_1h_51_df = prepare_ema_series(df_1h, 51)
+        ema_4h_51_df = prepare_ema_series(df_4h, 51)
+        ema_4h_101_df = prepare_ema_series(df_4h, 101)
 
     matches = check_away_and_breakout(
-        df_scan, df_1h, df_4h, ema_option, breakout_option, vol_mode, vol_condition, vol_lookback, enable_date, start_datetime, end_datetime
+        df_scan, ema_1h_51_df, ema_4h_51_df, ema_4h_101_df, ema_option, breakout_option, vol_mode, vol_condition, vol_lookback, enable_date, start_datetime, end_datetime, skip_htf_dist=skip_htf_dist
     )
 
     symbol_results = []
@@ -302,28 +398,23 @@ def process_single_symbol(symbol, tf_option, ema_option, breakout_option, vol_mo
             label_parts.append(match['bollinger_tag'])
         label_parts.append(match['position_tag'])
         coin_label = " ".join(label_parts)
-        base_symbol_text = f"{match['trend_symbol']} {coin_label}"
-        is_bullish = "Bullish" in match['Type']
-        is_bearish = "Bearish" in match['Type']
-
-        if match['is_away_below'] and is_bullish:
-            match['Symbol'] = f"🟢 {coin_label}"
-        elif match['is_away_above'] and is_bearish:
-            match['Symbol'] = f"🔴 {coin_label}"
-        else:
-            match['Symbol'] = base_symbol_text
+        match['Symbol'] = f"{match['trend_symbol']} {coin_label}"
 
         symbol_results.append(match)
 
-    return symbol_results
+    return symbol_results, None
 
 # Sidebar UI Options
 st.sidebar.header("⚙️ Screener Controls")
 
-# 1. EMA Period Selection
-ema_option = st.sidebar.selectbox("Select EMA Period:", [2, 3, 4, 5, 6], index=1)
+# 0. Exchange Selection
+exchange_label = st.sidebar.selectbox("Select Exchange:", list(EXCHANGE_OPTIONS.keys()), index=0)
+exchange_id = EXCHANGE_OPTIONS[exchange_label]
 
-# 2. Number of Top Binance Coins
+# 1. EMA Period Selection
+ema_option = st.sidebar.selectbox("Select EMA Period:", [2, 3, 4, 5, 6, 7], index=1)
+
+# 2. Number of Top Coins
 top_coins_count = st.sidebar.selectbox("Select Top Coins Count (by Volume):", [50, 100, 200, 400, 500, 600, 700], index=1)
 
 # 3. Timeframe Selection
@@ -334,6 +425,13 @@ breakout_option = st.sidebar.selectbox(
     "Select Breakout Type:", 
     ["Close Breakout", "High/Low Breakout"], 
     help="Close Breakout requires candle to close beyond away candle high/low. High/Low Breakout checks if wick/touch breaks high/low."
+)
+
+# Speed Option (Optional)
+skip_htf_dist = st.sidebar.checkbox(
+    "⚡ Turbo Scan (Skip 1h/4h EMA Dist)",
+    value=False,
+    help="On karne par 1h aur 4h ki extra API calls skip hongi aur scan ~3x tez chalega."
 )
 
 # 5. Volume Filter Options
@@ -362,14 +460,14 @@ if vol_mode == "Breakout Vol vs Away Vol":
 elif "Away Candle Vol vs Previous Candles" in vol_mode:
     vol_lookback = st.sidebar.selectbox(
         "Away Candles Lookback Count (N):",
-        [2, 3, 4, 5, 7, 10, 15, 20, 30],
-        index=3, # Default 5
+        LOOKBACK_OPTIONS_AWAY,
+        index=3,
         help="Away candle ka volume pichhli N candles ke mukable comparison ke liye."
     )
 elif vol_mode == "Breakout Candle Vol vs Previous Candles":
     vol_lookback = st.sidebar.selectbox(
         "Breakout Vol Higher Than Prev N Candles:",
-        [2, 3, 4, 5, 7, 10, 15, 20, 30],
+        LOOKBACK_OPTIONS_BREAKOUT,
         index=2,
         help="Breakout candle ka volume apni pichhli N candles ke volume se zyada hona chahiye."
     )
@@ -390,8 +488,8 @@ if enable_date:
         start_datetime = IST.localize(datetime.combine(selected_date, start_time_val))
         end_datetime = IST.localize(datetime.combine(selected_date, end_time_val))
     else:
-        start_datetime = IST.localize(datetime.combine(selected_date, time(0, 0)))
-        end_datetime = IST.localize(datetime.combine(selected_date, time(23, 59)))
+        start_datetime = IST.localize(datetime.combine(selected_date, time(0, 0))) - timedelta(minutes=5)
+        end_datetime = IST.localize(datetime.combine(selected_date, time(23, 59))) + timedelta(minutes=5)
 
 def style_breakout_symbol(row):
     """Color and bold only the requested Symbol cells in the results table."""
@@ -407,41 +505,48 @@ def style_breakout_symbol(row):
 
     return styles
 
-
 # Run Screener Button
 if st.button("🚀 Start Scanning"):
-    st.info(f"Fetching Binance Top {top_coins_count} pairs and scanning...")
-    symbols = get_top_binance_symbols(top_coins_count)
+    candle_limit = max(1500, vol_lookback + 120) if enable_date else max(300, vol_lookback + 100)
+    st.info(f"Fetching {exchange_label} Top {top_coins_count} pairs and scanning...")
+    symbols = get_top_exchange_symbols(exchange_id, top_coins_count)
 
     results = []
+    errors = []
     progress_bar = st.progress(0)
     status_text = st.empty()
 
     total_symbols = len(symbols)
     completed = 0
+    max_workers = 16 if exchange_id in ("binance", "okx") else 12
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_symbol = {
             executor.submit(
-                process_single_symbol, symbol, tf_option, ema_option, breakout_option, vol_mode, vol_condition, vol_lookback, enable_date, start_datetime, end_datetime
+                process_single_symbol, exchange_id, symbol, tf_option, ema_option, breakout_option, vol_mode, vol_condition, vol_lookback, enable_date, start_datetime, end_datetime, candle_limit, skip_htf_dist
             ): symbol for symbol in symbols
         }
 
         for future in as_completed(future_to_symbol):
             symbol = future_to_symbol[future]
             completed += 1
-            status_text.text(f"Scanning ({completed}/{total_symbols}): {symbol}")
+            status_text.text(f"Scanning {exchange_label} ({completed}/{total_symbols}): {symbol}")
             progress_bar.progress(completed / total_symbols)
 
             try:
-                res = future.result()
+                res, err = future.result()
                 if res:
                     results.extend(res)
-            except Exception:
-                pass
+                if err:
+                    errors.append(err)
+            except Exception as e:
+                errors.append(f"{symbol}: {str(e)[:120]}")
 
     status_text.text("Scanning Completed!")
     progress_bar.empty()
+
+    if errors and len(errors) >= max(5, total_symbols // 2):
+        st.error(f"{exchange_label} API se kaafi requests me error aaya (e.g. {errors[0]}). Agar Binance block/rate-limit kar raha ho toh Bybit ya OKX select karke scan karein.")
 
     if results:
         res_df = pd.DataFrame(results)
@@ -454,7 +559,7 @@ if st.button("🚀 Start Scanning"):
 
         final_df = res_df[cols]
 
-        st.success(f"Found {len(final_df)} matching setup(s)!")
+        st.success(f"Found {len(final_df)} matching setup(s) on {exchange_label}!")
         red_mask = (
             res_df['is_away_above'].fillna(False)
             & res_df['Type'].str.contains("Bearish", na=False)
@@ -499,11 +604,10 @@ if st.button("🚀 Start Scanning"):
             "(2) ⭐ = away candle se 2.30x+. (2) ⭐⭐ = away candle se 2.30x+ aur usse pehle wali candle se 1.60x+."
         )
 
-        # Keep the table interactive and style only the requested Symbol cells.
         styled_results = final_df.style.apply(
             style_breakout_symbol,
             axis=1
         )
         st.dataframe(styled_results, use_container_width=True)
     else:
-        st.warning("Selected criteria par koi coin scan me nahi mila.")
+        st.warning(f"Selected criteria par {exchange_label} me koi coin scan me nahi mila.")
